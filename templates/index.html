@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Голосовой ассистент</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 980px; margin: 40px auto; padding: 20px; background: #f7f7f7; }
+        .card { background: white; padding: 24px; border-radius: 14px; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.08); }
+        h2 { margin-top: 0; }
+        textarea, select, input { width: 100%; padding: 10px; margin-bottom: 12px; border-radius: 8px; border: 1px solid #ccc; box-sizing: border-box; font-size: 15px; }
+        button { padding: 10px 14px; margin: 5px 8px 5px 0; border-radius: 8px; border: none; cursor: pointer; font-size: 15px; }
+        .primary { background: #2563eb; color: white; }
+        .secondary { background: #e5e7eb; color: #111827; }
+        .danger { background: #dc2626; color: white; }
+        #status { margin-top: 12px; color: #374151; font-size: 14px; white-space: pre-wrap; }
+        .hint { color: #6b7280; font-size: 13px; line-height: 1.45; margin-top: 12px; }
+        label { font-weight: 600; display: block; margin-bottom: 6px; }
+    </style>
+</head>
+<body>
+<div class="card">
+    <h2>Голосовой ассистент</h2>
+
+    <label for="text">Текст</label>
+    <textarea id="text" rows="8" placeholder="Введите текст для озвучивания"></textarea>
+
+    <label for="engine">Движок</label>
+    <select id="engine">
+        <option value="system">system</option>
+        <option value="neural">neural</option>
+        <option value="auto">auto</option>
+    </select>
+
+    <label for="voice">Голос</label>
+    <select id="voice"></select>
+
+    <label for="rate">Скорость</label>
+    <input id="rate" type="number" step="0.1" min="0.1" value="1.0">
+
+    <div>
+        <button type="button" class="primary" id="speakBtn">Озвучить</button>
+        <button type="button" class="secondary" id="pauseBtn">Пауза</button>
+        <button type="button" class="secondary" id="resumeBtn">Продолжить</button>
+        <button type="button" class="danger" id="stopBtn">Стоп</button>
+        <button type="button" class="secondary" id="clearBtn">Очистить поле</button>
+    </div>
+
+    <div id="status">Готов</div>
+
+    <div class="hint">
+        Переходы между фрагментами теперь сглаживаются небольшим перекрытием, а при паузе позиция
+        продолжения считается по фактической длительности уже озвученных кусков. Благодаря этому
+        после смены голоса/скорости воспроизведение сразу останавливается, а по кнопке «Продолжить» запускается с того же места уже с новыми настройками и без заметных стыков.
+    </div>
+</div>
+
+<script>
+const textEl = document.getElementById("text");
+const engineEl = document.getElementById("engine");
+const voiceEl = document.getElementById("voice");
+const rateEl = document.getElementById("rate");
+const statusEl = document.getElementById("status");
+const speakBtn = document.getElementById("speakBtn");
+const pauseBtn = document.getElementById("pauseBtn");
+const resumeBtn = document.getElementById("resumeBtn");
+const stopBtn = document.getElementById("stopBtn");
+const clearBtn = document.getElementById("clearBtn");
+
+let capabilities = null;
+let availableVoices = { system: [], neural: [] };
+let lastKnownText = "";
+
+let audioCtx = null;
+let masterGain = null;
+let currentSessionId = 0;
+let currentPlaybackSettings = null;
+let isPlaying = false;
+let isPaused = false;
+let activeText = "";
+let remainingText = "";
+let chunkTexts = [];
+let decodedChunks = [];
+let chunkDurations = [];
+let scheduledSources = [];
+let chunkStartTimes = [];
+let chunkEffectiveStarts = [];
+let firstChunkCtxStart = 0;
+let nextScheduleTime = 0;
+let overlapSec = 0.07;
+let prefetchAbortController = null;
+let currentCharOffset = 0;
+let loopPromise = null;
+
+function normalizeInputText(text) {
+    return String(text || "").replace(/\u00A0/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function getCurrentText() {
+    const raw = typeof textEl.value === "string" ? textEl.value : "";
+    const cleaned = normalizeInputText(raw);
+    if (cleaned) lastKnownText = cleaned;
+    return cleaned || lastKnownText;
+}
+
+function getResolvedEngine(engineValue, text) {
+    const cleaned = normalizeInputText(text);
+    const caps = capabilities || {};
+    const systemAvailable = !!caps.system?.available;
+    const neuralAvailable = !!caps.neural?.available;
+
+    if (engineValue === "system") return systemAvailable ? "system" : (neuralAvailable ? "neural" : "system");
+    if (engineValue === "neural") return neuralAvailable ? "neural" : (systemAvailable ? "system" : "neural");
+
+    if (cleaned.length <= 80 && systemAvailable) return "system";
+    if (neuralAvailable) return "neural";
+    if (systemAvailable) return "system";
+    return cleaned.length <= 80 ? "system" : "neural";
+}
+
+function getCurrentSettings(text) {
+    const cleanedText = normalizeInputText(text);
+    return {
+        engine: getResolvedEngine(engineEl.value, cleanedText),
+        voice: voiceEl.value || "default",
+        rate: parseFloat(rateEl.value || "1.0")
+    };
+}
+
+function sameSettings(a, b) {
+    if (!a || !b) return false;
+    return a.engine === b.engine && a.voice === b.voice && Math.abs(a.rate - b.rate) < 1e-9;
+}
+
+function fillVoiceSelect(voices) {
+    const previousValue = voiceEl.value || "default";
+    voiceEl.innerHTML = "";
+
+    const defaultOption = document.createElement("option");
+    defaultOption.value = "default";
+    defaultOption.textContent = "default";
+    voiceEl.appendChild(defaultOption);
+
+    for (const voice of voices) {
+        const option = document.createElement("option");
+        option.value = voice;
+        option.textContent = voice;
+        voiceEl.appendChild(option);
+    }
+
+    const validVoices = ["default", ...voices];
+    voiceEl.value = validVoices.includes(previousValue) ? previousValue : "default";
+}
+
+function updateVoiceOptions() {
+    const resolvedEngine = getResolvedEngine(engineEl.value, getCurrentText());
+    fillVoiceSelect(availableVoices[resolvedEngine] || []);
+}
+
+async function loadVoices() {
+    try {
+        const [voicesResponse, capabilitiesResponse] = await Promise.all([
+            fetch("/voices"),
+            fetch("/capabilities")
+        ]);
+        if (!voicesResponse.ok) throw new Error("Не удалось загрузить голоса");
+        if (!capabilitiesResponse.ok) throw new Error("Не удалось загрузить возможности движков");
+
+        const data = await voicesResponse.json();
+        capabilities = await capabilitiesResponse.json();
+        availableVoices.system = data.system || [];
+        availableVoices.neural = data.neural || [];
+        updateVoiceOptions();
+
+        if (!capabilities.system?.available && !capabilities.neural?.available) {
+            statusEl.textContent = "Нет доступных движков синтеза. Установите Kokoro или запустите проект на macOS с say.";
+        }
+    } catch (error) {
+        console.error(error);
+        statusEl.textContent = "Не удалось загрузить список голосов и возможности движков.";
+    }
+}
+
+function splitLongFragment(text, maxLen) {
+    const words = text.split(/\s+/).filter(Boolean);
+    const parts = [];
+    let current = "";
+
+    for (const word of words) {
+        const candidate = current ? `${current} ${word}` : word;
+        if (candidate.length <= maxLen) {
+            current = candidate;
+        } else {
+            if (current) parts.push(current);
+            current = word;
+        }
+    }
+    if (current) parts.push(current);
+    return parts;
+}
+
+function splitTextIntoChunks(text, maxLen = 90) {
+    const cleaned = normalizeInputText(text);
+    if (!cleaned) return [];
+
+    const roughParts = cleaned
+        .split(/(?<=[.!?…;:])\s+|(?<=,)\s+/)
+        .map(part => normalizeInputText(part))
+        .filter(Boolean);
+
+    const chunks = [];
+    let current = "";
+
+    for (const part of roughParts) {
+        if (!current) {
+            if (part.length <= maxLen) {
+                current = part;
+            } else {
+                chunks.push(...splitLongFragment(part, maxLen));
+            }
+            continue;
+        }
+
+        const candidate = `${current} ${part}`;
+        if (candidate.length <= maxLen) {
+            current = candidate;
+        } else {
+            chunks.push(current);
+            if (part.length <= maxLen) {
+                current = part;
+            } else {
+                chunks.push(...splitLongFragment(part, maxLen));
+                current = "";
+            }
+        }
+    }
+
+    if (current) chunks.push(current);
+    return chunks.filter(Boolean);
+}
+
+async function ensureAudioContext() {
+    if (!audioCtx) {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        audioCtx = new Ctx();
+        masterGain = audioCtx.createGain();
+        masterGain.gain.value = 1;
+        masterGain.connect(audioCtx.destination);
+    }
+    if (audioCtx.state === "suspended") {
+        await audioCtx.resume();
+    }
+}
+
+function abortPrefetch() {
+    if (prefetchAbortController) {
+        try { prefetchAbortController.abort(); } catch (_) {}
+        prefetchAbortController = null;
+    }
+}
+
+function stopScheduledSources() {
+    for (const item of scheduledSources) {
+        try { item.source.onended = null; } catch (_) {}
+        try { item.source.stop(); } catch (_) {}
+    }
+    scheduledSources = [];
+}
+
+function resetPlaybackState() {
+    currentSessionId += 1;
+    abortPrefetch();
+    stopScheduledSources();
+    currentPlaybackSettings = null;
+    isPlaying = false;
+    isPaused = false;
+    activeText = "";
+    remainingText = "";
+    chunkTexts = [];
+    decodedChunks = [];
+    chunkDurations = [];
+    chunkStartTimes = [];
+    chunkEffectiveStarts = [];
+    firstChunkCtxStart = 0;
+    nextScheduleTime = 0;
+    currentCharOffset = 0;
+    loopPromise = null;
+}
+
+async function synthesizeDecodedChunk(chunkText, settings, sessionId, signal) {
+    const response = await fetch("/synthesize", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            text: chunkText,
+            engine: settings.engine,
+            voice: settings.voice,
+            rate: settings.rate
+        }),
+        signal
+    });
+
+    if (!response.ok) {
+        let detail = "Ошибка синтеза";
+        try {
+            const data = await response.json();
+            detail = data.detail || detail;
+        } catch (_) {}
+        throw new Error(detail);
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    if (sessionId !== currentSessionId) return null;
+    await ensureAudioContext();
+    const decoded = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
+    if (sessionId !== currentSessionId) return null;
+    return decoded;
+}
+
+function scheduleDecodedChunk(index, sessionId) {
+    if (sessionId !== currentSessionId) return;
+    const buffer = decodedChunks[index];
+    if (!buffer) return;
+
+    const isFirst = index === 0;
+    const source = audioCtx.createBufferSource();
+    const gainNode = audioCtx.createGain();
+    source.buffer = buffer;
+    source.connect(gainNode);
+    gainNode.connect(masterGain);
+
+    const fade = Math.min(overlapSec, Math.max(0.02, buffer.duration / 4));
+    const startAt = isFirst ? audioCtx.currentTime + 0.05 : Math.max(audioCtx.currentTime + 0.02, nextScheduleTime - overlapSec);
+    const effectiveStart = isFirst ? startAt : startAt + overlapSec;
+
+    gainNode.gain.setValueAtTime(isFirst ? 1 : 0, startAt);
+    if (!isFirst) {
+        gainNode.gain.linearRampToValueAtTime(1, startAt + fade);
+    }
+    const fadeOutStart = Math.max(startAt + fade, startAt + buffer.duration - fade);
+    gainNode.gain.setValueAtTime(1, fadeOutStart);
+    gainNode.gain.linearRampToValueAtTime(0, startAt + buffer.duration);
+
+    source.start(startAt);
+    source.onended = () => {
+        scheduledSources = scheduledSources.filter(item => item.source !== source);
+        if (sessionId !== currentSessionId) return;
+        if (index === chunkTexts.length - 1 && !isPaused) {
+            isPlaying = false;
+            remainingText = "";
+            statusEl.textContent = "Готово";
+        }
+    };
+
+    scheduledSources.push({ source, gainNode, index, startAt, effectiveStart, duration: buffer.duration });
+    chunkStartTimes[index] = startAt;
+    chunkEffectiveStarts[index] = effectiveStart;
+    chunkDurations[index] = buffer.duration;
+
+    if (isFirst) {
+        firstChunkCtxStart = effectiveStart;
+    }
+    nextScheduleTime = startAt + buffer.duration;
+}
+
+async function prefetchAndSchedule(index, sessionId) {
+    for (let i = index; i < chunkTexts.length; i += 1) {
+        if (sessionId !== currentSessionId || isPaused) return;
+        if (decodedChunks[i]) {
+            if (!chunkStartTimes[i]) scheduleDecodedChunk(i, sessionId);
+            continue;
+        }
+
+        prefetchAbortController = new AbortController();
+        const decoded = await synthesizeDecodedChunk(chunkTexts[i], currentPlaybackSettings, sessionId, prefetchAbortController.signal);
+        if (sessionId !== currentSessionId || isPaused || !decoded) return;
+        decodedChunks[i] = decoded;
+        chunkDurations[i] = decoded.duration;
+        scheduleDecodedChunk(i, sessionId);
+
+        if (i === 0) {
+            statusEl.textContent = `Воспроизведение началось (${currentPlaybackSettings.engine}, голос: ${currentPlaybackSettings.voice})`;
+        } else {
+            statusEl.textContent = `Воспроизводится ${Math.min(i + 1, chunkTexts.length)}/${chunkTexts.length}, следующие фрагменты догружаются`;
+        }
+    }
+}
+
+function getElapsedPlaybackSec() {
+    if (!audioCtx || !firstChunkCtxStart) return 0;
+    return Math.max(0, audioCtx.currentTime - firstChunkCtxStart);
+}
+
+function computePositionFromElapsed(elapsedSec) {
+    if (!chunkTexts.length) {
+        return { chunkIndex: 0, charIndexInChunk: 0, globalCharOffset: 0 };
+    }
+
+    let consumedTime = 0;
+    let globalCharOffset = 0;
+
+    for (let i = 0; i < chunkTexts.length; i += 1) {
+        const chunkText = chunkTexts[i] || "";
+        const duration = chunkDurations[i] || Math.max(0.25, chunkText.length / 18);
+        const effectiveDuration = i < chunkTexts.length - 1 ? Math.max(0.05, duration - overlapSec) : duration;
+
+        if (elapsedSec <= consumedTime + effectiveDuration) {
+            const local = Math.max(0, elapsedSec - consumedTime);
+            const ratio = Math.max(0, Math.min(1, local / effectiveDuration));
+            const charIndexInChunk = Math.min(chunkText.length, Math.floor(chunkText.length * ratio));
+            return {
+                chunkIndex: i,
+                charIndexInChunk,
+                globalCharOffset: globalCharOffset + charIndexInChunk
+            };
+        }
+
+        consumedTime += effectiveDuration;
+        globalCharOffset += chunkText.length + 1;
+    }
+
+    return {
+        chunkIndex: chunkTexts.length - 1,
+        charIndexInChunk: (chunkTexts[chunkTexts.length - 1] || "").length,
+        globalCharOffset: activeText.length
+    };
+}
+
+function buildRemainingTextFromPosition(position) {
+    if (!chunkTexts.length) return "";
+    const idx = Math.max(0, Math.min(chunkTexts.length - 1, position.chunkIndex || 0));
+    const currentChunk = chunkTexts[idx] || "";
+    const currentRest = normalizeInputText(currentChunk.slice(position.charIndexInChunk || 0));
+    const laterRest = chunkTexts.slice(idx + 1).join(" ");
+    return normalizeInputText(`${currentRest} ${laterRest}`);
+}
+
+async function startChunkedPlayback(text) {
+    const cleanedText = normalizeInputText(text);
+    if (!cleanedText) {
+        statusEl.textContent = "Поле текста пустое или не удалось получить введённый текст.";
+        return;
+    }
+
+    const settings = getCurrentSettings(cleanedText);
+    resetPlaybackState();
+    await ensureAudioContext();
+
+    const sessionId = currentSessionId;
+    currentPlaybackSettings = settings;
+    activeText = cleanedText;
+    remainingText = cleanedText;
+    chunkTexts = splitTextIntoChunks(cleanedText, settings.engine === "system" ? 72 : 110);
+
+    if (!chunkTexts.length) {
+        statusEl.textContent = "Не удалось разбить текст на фрагменты.";
+        return;
+    }
+
+    isPlaying = true;
+    isPaused = false;
+    statusEl.textContent = `Генерируется первый фрагмент из ${chunkTexts.length}...`;
+
+    try {
+        loopPromise = prefetchAndSchedule(0, sessionId);
+        await loopPromise;
+    } catch (error) {
+        if (error?.name === "AbortError") return;
+        console.error(error);
+        isPlaying = false;
+        isPaused = false;
+        statusEl.textContent = error?.message || "Ошибка запуска озвучивания";
+    }
+}
+
+function pauseAudio() {
+    if (!isPlaying || isPaused) return;
+    const elapsedSec = getElapsedPlaybackSec();
+    const position = computePositionFromElapsed(elapsedSec);
+    currentCharOffset = position.globalCharOffset;
+    remainingText = buildRemainingTextFromPosition(position);
+    isPaused = true;
+    isPlaying = false;
+    abortPrefetch();
+    stopScheduledSources();
+    statusEl.textContent = `Пауза. Позиция сохранена: примерно ${currentCharOffset} символов от начала.`;
+}
+
+async function resumeAudio() {
+    const textToResume = normalizeInputText(remainingText || getCurrentText());
+    if (!textToResume) {
+        statusEl.textContent = "Нет текста для продолжения.";
+        return;
+    }
+
+    const settingsNow = getCurrentSettings(textToResume);
+    const changed = !sameSettings(settingsNow, currentPlaybackSettings);
+    statusEl.textContent = changed
+        ? "Продолжение с нового голоса/скорости: первый фрагмент запускается сразу, переходы между кусками сглажены."
+        : "Продолжение...";
+
+    await startChunkedPlayback(textToResume);
+}
+
+function stopAudio(resetText = false) {
+    resetPlaybackState();
+    if (resetText) {
+        lastKnownText = normalizeInputText(textEl.value || "");
+    }
+    statusEl.textContent = "Остановлено";
+}
+
+function clearText() {
+    textEl.value = "";
+    lastKnownText = "";
+    resetPlaybackState();
+    statusEl.textContent = "Поле очищено";
+}
+
+speakBtn.addEventListener("click", async (event) => {
+    event.preventDefault();
+    lastKnownText = normalizeInputText(textEl.value || "");
+    await startChunkedPlayback(lastKnownText);
+});
+
+pauseBtn.addEventListener("click", pauseAudio);
+resumeBtn.addEventListener("click", resumeAudio);
+stopBtn.addEventListener("click", () => stopAudio(true));
+clearBtn.addEventListener("click", clearText);
+function pauseForSettingsChange(reason) {
+    if (isPlaying && !isPaused) {
+        pauseAudio();
+    }
+    if (reason === "engine") {
+        statusEl.textContent = "Движок изменён. Воспроизведение остановлено. Нажмите «Продолжить», чтобы продолжить с этого же места уже с новыми настройками.";
+    } else if (reason === "voice") {
+        statusEl.textContent = "Голос изменён. Воспроизведение остановлено. Нажмите «Продолжить», чтобы продолжить с этого же места уже новым голосом.";
+    } else if (reason === "rate") {
+        statusEl.textContent = "Скорость изменена. Воспроизведение остановлено. Нажмите «Продолжить», чтобы продолжить с этого же места уже с новой скоростью.";
+    }
+}
+
+engineEl.addEventListener("change", () => {
+    updateVoiceOptions();
+    pauseForSettingsChange("engine");
+});
+textEl.addEventListener("input", () => { lastKnownText = normalizeInputText(textEl.value || ""); });
+voiceEl.addEventListener("change", () => {
+    pauseForSettingsChange("voice");
+});
+rateEl.addEventListener("change", () => {
+    pauseForSettingsChange("rate");
+});
+
+loadVoices();
+</script>
+</body>
+</html>
