@@ -2,21 +2,23 @@ from __future__ import annotations
 
 import ast
 import math
+import operator
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 MOSCOW_TZ = ZoneInfo('Europe/Moscow')
+
 _ALLOWED_BINARY_OPS = {
-    ast.Add: lambda a, b: a + b,
-    ast.Sub: lambda a, b: a - b,
-    ast.Mult: lambda a, b: a * b,
-    ast.Div: lambda a, b: a / b,
-    ast.Mod: lambda a, b: a % b,
-    ast.Pow: lambda a, b: a ** b,
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.Pow: operator.pow,
+    ast.Mod: operator.mod,
 }
 _ALLOWED_UNARY_OPS = {
-    ast.UAdd: lambda a: a,
-    ast.USub: lambda a: -a,
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
 }
 
 
@@ -25,8 +27,6 @@ def _eval_ast(node: ast.AST) -> float:
         return _eval_ast(node.body)
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
         return float(node.value)
-    if isinstance(node, ast.Num):
-        return float(node.n)
     if isinstance(node, ast.BinOp) and type(node.op) in _ALLOWED_BINARY_OPS:
         left = _eval_ast(node.left)
         right = _eval_ast(node.right)
@@ -70,21 +70,30 @@ def generate_assistant_reply(text: str) -> str:
         return f'Сейчас {now.strftime("%H:%M")} по московскому времени.'
 
     if any(token in lowered for token in ['какое сегодня число', 'сегодняшняя дата', 'какой сегодня день', 'дата']) and len(lowered) < 100:
-        return f'Сегодня {now.strftime("%d.%m.%Y")}.'
+        return f'Сегодня {now.strftime("%d.%m.%Y")}. '
 
-    if any(token in lowered for token in ['привет', 'здравствуй', 'добрый день', 'добрый вечер']):
-        return 'Привет! Я готов озвучить текст или ответить на простой запрос в демонстрационном режиме.'
+    if any(token in lowered for token in ['привет', 'здравствуй', 'добрый день', 'добрый вечер', 'доброе утро']):
+        return 'Привет! Я готов помочь: могу распознать твою фразу, сформировать короткий ответ и озвучить его.'
 
-    if 'кто ты' in lowered or 'что ты умеешь' in lowered:
+    if any(token in lowered for token in ['как тебя зовут', 'кто ты', 'что ты умеешь']):
         return (
-            'Я демонстрационный голосовой помощник. Сейчас я умею озвучивать текст, '
-            'выбирать движок синтеза и отвечать на простые офлайн-запросы: приветствие, дата, время и вычисления.'
+            'Я локальный демонстрационный голосовой помощник. Сейчас я умею распознавать речь, '
+            'озвучивать текст и отвечать на базовые офлайн-запросы: дата, время, простые вычисления и короткие команды.'
+        )
+
+    if any(token in lowered for token in ['помощь', 'что можно сказать', 'что спросить']):
+        return (
+            'Попробуй сказать: привет, который час, какая сегодня дата, 25 умножить на 4, '
+            'или просто продиктуй текст для озвучивания.'
         )
 
     if any(token in lowered for token in ['спасибо', 'благодарю']):
         return 'Пожалуйста!'
 
+    if any(token in lowered for token in ['повтори', 'озвучь текст', 'прочитай текст']) and len(cleaned) < 120:
+        return 'Текст готов к озвучиванию. Нажми кнопку голосового ответа, и я воспроизведу результат.'
+
     return (
         'Я понял запрос. В текущей версии это офлайн-демо без большой языковой модели, '
-        'поэтому я могу надежно озвучить текст и обработать только базовые команды.'
+        'поэтому я могу надежно распознавать речь, озвучивать текст и обрабатывать базовые команды.'
     )

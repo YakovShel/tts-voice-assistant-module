@@ -6,15 +6,21 @@
     <style>
         body { font-family: Arial, sans-serif; max-width: 980px; margin: 40px auto; padding: 20px; background: #f7f7f7; }
         .card { background: white; padding: 24px; border-radius: 14px; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.08); }
-        h2 { margin-top: 0; }
+        h2, h3 { margin-top: 0; }
         textarea, select, input { width: 100%; padding: 10px; margin-bottom: 12px; border-radius: 8px; border: 1px solid #ccc; box-sizing: border-box; font-size: 15px; }
         button { padding: 10px 14px; margin: 5px 8px 5px 0; border-radius: 8px; border: none; cursor: pointer; font-size: 15px; }
+        button:disabled { opacity: 0.6; cursor: not-allowed; }
         .primary { background: #2563eb; color: white; }
         .secondary { background: #e5e7eb; color: #111827; }
         .danger { background: #dc2626; color: white; }
         #status { margin-top: 12px; color: #374151; font-size: 14px; white-space: pre-wrap; }
-        .hint { color: #6b7280; font-size: 13px; line-height: 1.45; margin-top: 12px; }
+        .hint { color: #6b7280; font-size: 13px; line-height: 1.45; margin-top: 12px; white-space: pre-wrap; }
         label { font-weight: 600; display: block; margin-bottom: 6px; }
+        .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+        .meter { width: 100%; height: 14px; border-radius: 999px; background: #e5e7eb; overflow: hidden; margin-top: 10px; }
+        .meter-bar { height: 100%; width: 0%; border-radius: 999px; background: linear-gradient(90deg, #22c55e, #eab308, #ef4444); transition: width 80ms linear; }
+        .subtle { color: #4b5563; font-size: 13px; margin-top: 8px; }
+        @media (max-width: 700px) { .row { grid-template-columns: 1fr; } }
     </style>
 </head>
 <body>
@@ -22,23 +28,30 @@
     <h2>Голосовой ассистент</h2>
 
     <label for="text">Текст</label>
-    <textarea id="text" rows="8" placeholder="Введите текст для озвучивания"></textarea>
+    <textarea id="text" rows="8" placeholder="Введите текст для озвучивания или получите его из распознавания речи"></textarea>
 
-    <label for="engine">Движок</label>
-    <select id="engine">
-        <option value="system">system</option>
-        <option value="neural">neural</option>
-        <option value="auto">auto</option>
-    </select>
-
-    <label for="voice">Голос</label>
-    <select id="voice"></select>
+    <div class="row">
+        <div>
+            <label for="engine">Движок</label>
+            <select id="engine">
+                <option value="system">system</option>
+                <option value="neural">neural</option>
+                <option value="auto" selected>auto</option>
+            </select>
+        </div>
+        <div>
+            <label for="voice">Голос</label>
+            <select id="voice"></select>
+        </div>
+    </div>
 
     <label for="rate">Скорость</label>
     <input id="rate" type="number" step="0.1" min="0.1" value="1.0">
 
     <div>
-        <button type="button" class="primary" id="speakBtn">Озвучить</button>
+        <button type="button" class="primary" id="speakBtn">Озвучить текст</button>
+        <button type="button" class="secondary" id="assistantReplyBtn">Ответить текстом</button>
+        <button type="button" class="secondary" id="voiceReplyBtn">Ответить голосом</button>
         <button type="button" class="secondary" id="pauseBtn">Пауза</button>
         <button type="button" class="secondary" id="resumeBtn">Продолжить</button>
         <button type="button" class="danger" id="stopBtn">Стоп</button>
@@ -47,11 +60,25 @@
 
     <div id="status">Готов</div>
 
-    <div class="hint">
-        Переходы между фрагментами теперь сглаживаются небольшим перекрытием, а при паузе позиция
-        продолжения считается по фактической длительности уже озвученных кусков. Благодаря этому
-        после смены голоса/скорости воспроизведение сразу останавливается, а по кнопке «Продолжить» запускается с того же места уже с новыми настройками и без заметных стыков.
+    <hr style="margin:18px 0; border:none; border-top:1px solid #e5e7eb;">
+
+    <h3 style="font-size:18px;">Распознавание речи</h3>
+    <div>
+        <button type="button" class="primary" id="recordBtn">Начать запись</button>
+        <button type="button" class="secondary" id="stopRecordBtn">Остановить запись</button>
+        <button type="button" class="secondary" id="recognizeBtn">Только распознать</button>
+        <button type="button" class="secondary" id="voiceTurnBtn">Распознать и ответить голосом</button>
     </div>
+    <label for="language">Язык распознавания</label>
+    <input id="language" type="text" placeholder="Например: ru, en, de" value="ru">
+    <div class="meter" aria-label="Уровень микрофона">
+        <div id="micLevelBar" class="meter-bar"></div>
+    </div>
+    <div id="micLevelText" class="subtle">Индикатор микрофона ждёт начала записи.</div>
+    <div id="recordingStatus" class="hint">Запись ещё не создана.</div>
+    <audio id="recordedAudio" controls style="width:100%; margin-top:10px; display:none;"></audio>
+
+    <div class="hint">Рекомендация: для русской речи оставь язык распознавания ru. Смешанный текст на русском и английском озвучивается в одном сообщении, а во время записи приложение показывает уровень микрофона и автоматически останавливает запись после короткой тишины.</div>
 </div>
 
 <script>
@@ -61,10 +88,21 @@ const voiceEl = document.getElementById("voice");
 const rateEl = document.getElementById("rate");
 const statusEl = document.getElementById("status");
 const speakBtn = document.getElementById("speakBtn");
+const assistantReplyBtn = document.getElementById("assistantReplyBtn");
+const voiceReplyBtn = document.getElementById("voiceReplyBtn");
 const pauseBtn = document.getElementById("pauseBtn");
 const resumeBtn = document.getElementById("resumeBtn");
 const stopBtn = document.getElementById("stopBtn");
 const clearBtn = document.getElementById("clearBtn");
+const recordBtn = document.getElementById("recordBtn");
+const stopRecordBtn = document.getElementById("stopRecordBtn");
+const recognizeBtn = document.getElementById("recognizeBtn");
+const voiceTurnBtn = document.getElementById("voiceTurnBtn");
+const languageEl = document.getElementById("language");
+const recordingStatusEl = document.getElementById("recordingStatus");
+const recordedAudioEl = document.getElementById("recordedAudio");
+const micLevelBarEl = document.getElementById("micLevelBar");
+const micLevelTextEl = document.getElementById("micLevelText");
 
 let capabilities = null;
 let availableVoices = { system: [], neural: [] };
@@ -90,9 +128,26 @@ let overlapSec = 0.07;
 let prefetchAbortController = null;
 let currentCharOffset = 0;
 let loopPromise = null;
+let mediaRecorder = null;
+let mediaStream = null;
+let recordedChunks = [];
+let recordedBlob = null;
+let asrCapabilities = null;
+let micMonitorAudioCtx = null;
+let micAnalyser = null;
+let micSourceNode = null;
+let micLevelAnimationFrame = null;
+let hasDetectedSpeech = false;
+let recordingStartedAt = 0;
+let lastVoiceActivityAt = 0;
+let lastStopReason = 'manual';
+
+const AUTO_STOP_SILENCE_MS = 1800;
+const MIN_RECORDING_MS = 1200;
+const MIC_RMS_THRESHOLD = 0.035;
 
 function normalizeInputText(text) {
-    return String(text || "").replace(/\u00A0/g, " ").replace(/\s+/g, " ").trim();
+    return String(text || "").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
 }
 
 function getCurrentText() {
@@ -100,6 +155,17 @@ function getCurrentText() {
     const cleaned = normalizeInputText(raw);
     if (cleaned) lastKnownText = cleaned;
     return cleaned || lastKnownText;
+}
+
+function setBusy(button, busy, busyText) {
+    if (!button) return;
+    if (busy) {
+        button.dataset.originalText = button.textContent;
+        button.textContent = busyText || button.textContent;
+    } else if (button.dataset.originalText) {
+        button.textContent = button.dataset.originalText;
+    }
+    button.disabled = !!busy;
 }
 
 function getResolvedEngine(engineValue, text) {
@@ -134,19 +200,16 @@ function sameSettings(a, b) {
 function fillVoiceSelect(voices) {
     const previousValue = voiceEl.value || "default";
     voiceEl.innerHTML = "";
-
     const defaultOption = document.createElement("option");
     defaultOption.value = "default";
     defaultOption.textContent = "default";
     voiceEl.appendChild(defaultOption);
-
     for (const voice of voices) {
         const option = document.createElement("option");
         option.value = voice;
         option.textContent = voice;
         voiceEl.appendChild(option);
     }
-
     const validVoices = ["default", ...voices];
     voiceEl.value = validVoices.includes(previousValue) ? previousValue : "default";
 }
@@ -154,6 +217,132 @@ function fillVoiceSelect(voices) {
 function updateVoiceOptions() {
     const resolvedEngine = getResolvedEngine(engineEl.value, getCurrentText());
     fillVoiceSelect(availableVoices[resolvedEngine] || []);
+}
+
+function setRecordingStatus(message) {
+    recordingStatusEl.textContent = message;
+}
+
+function setMicLevel(level) {
+    const safeLevel = Math.max(0, Math.min(1, Number(level) || 0));
+    if (micLevelBarEl) micLevelBarEl.style.width = `${Math.round(safeLevel * 100)}%`;
+}
+
+function setMicLevelText(message) {
+    if (micLevelTextEl) micLevelTextEl.textContent = message;
+}
+
+function updateRecordingButtons() {
+    const isRecording = !!mediaRecorder && mediaRecorder.state === 'recording';
+    recordBtn.disabled = isRecording;
+    stopRecordBtn.disabled = !isRecording;
+    const hasAudio = !!recordedBlob && recordedBlob.size > 0;
+    recognizeBtn.disabled = isRecording || !hasAudio;
+    voiceTurnBtn.disabled = isRecording || !hasAudio;
+}
+
+function stopMicMonitoring(resetVisualState = true) {
+    if (micLevelAnimationFrame) {
+        cancelAnimationFrame(micLevelAnimationFrame);
+        micLevelAnimationFrame = null;
+    }
+    if (micSourceNode) {
+        try { micSourceNode.disconnect(); } catch (_) {}
+        micSourceNode = null;
+    }
+    if (micAnalyser) {
+        try { micAnalyser.disconnect(); } catch (_) {}
+        micAnalyser = null;
+    }
+    if (micMonitorAudioCtx) {
+        try { micMonitorAudioCtx.close(); } catch (_) {}
+        micMonitorAudioCtx = null;
+    }
+    if (resetVisualState) {
+        setMicLevel(0);
+        setMicLevelText('Индикатор микрофона ждёт начала записи.');
+    }
+}
+
+async function startMicMonitoring(stream) {
+    stopMicMonitoring(false);
+    const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextCtor) {
+        setMicLevelText('В этом браузере нет Web Audio API для индикатора микрофона.');
+        return;
+    }
+    micMonitorAudioCtx = new AudioContextCtor();
+    micSourceNode = micMonitorAudioCtx.createMediaStreamSource(stream);
+    micAnalyser = micMonitorAudioCtx.createAnalyser();
+    micAnalyser.fftSize = 2048;
+    micAnalyser.smoothingTimeConstant = 0.8;
+    micSourceNode.connect(micAnalyser);
+    const buffer = new Uint8Array(micAnalyser.fftSize);
+
+    const tick = () => {
+        if (!micAnalyser || !mediaRecorder || mediaRecorder.state !== 'recording') {
+            micLevelAnimationFrame = null;
+            return;
+        }
+        micAnalyser.getByteTimeDomainData(buffer);
+        let sumSquares = 0;
+        for (let i = 0; i < buffer.length; i += 1) {
+            const sample = (buffer[i] - 128) / 128;
+            sumSquares += sample * sample;
+        }
+        const rms = Math.sqrt(sumSquares / buffer.length);
+        const boostedLevel = Math.max(0, Math.min(1, rms * 6.5));
+        setMicLevel(boostedLevel);
+
+        const now = Date.now();
+        if (rms >= MIC_RMS_THRESHOLD) {
+            hasDetectedSpeech = true;
+            lastVoiceActivityAt = now;
+            setMicLevelText(`Микрофон активен. Уровень: ${Math.round(boostedLevel * 100)}%`);
+        } else if (hasDetectedSpeech) {
+            const silenceMs = now - lastVoiceActivityAt;
+            const leftMs = Math.max(0, AUTO_STOP_SILENCE_MS - silenceMs);
+            setMicLevelText(`Тишина: ещё ${Math.ceil(leftMs / 100) / 10} c до автоостановки.`);
+            if ((now - recordingStartedAt) >= MIN_RECORDING_MS && silenceMs >= AUTO_STOP_SILENCE_MS) {
+                lastStopReason = 'silence';
+                stopRecording('silence');
+                return;
+            }
+        } else {
+            setMicLevelText('Слушаю микрофон. Скажи фразу — запись остановится после тишины.');
+        }
+
+        micLevelAnimationFrame = requestAnimationFrame(tick);
+    };
+
+    micLevelAnimationFrame = requestAnimationFrame(tick);
+}
+
+function cleanupRecordingStream() {
+    stopMicMonitoring(false);
+    if (mediaStream) {
+        for (const track of mediaStream.getTracks()) {
+            try { track.stop(); } catch (_) {}
+        }
+        mediaStream = null;
+    }
+}
+
+async function loadAsrCapabilities() {
+    try {
+        const response = await fetch('/asr-capabilities');
+        if (!response.ok) throw new Error('Не удалось проверить модуль распознавания');
+        asrCapabilities = await response.json();
+        if (asrCapabilities.available) {
+            const readyText = asrCapabilities.ready ? 'готов' : 'инициализируется';
+            setRecordingStatus(`Распознавание доступно (${asrCapabilities.engine}, модель: ${asrCapabilities.model_size}, VAD: ${asrCapabilities.vad_filter ? 'on' : 'off'}, статус: ${readyText}).`);
+        } else {
+            setRecordingStatus(`Распознавание недоступно: ${asrCapabilities.reason}`);
+        }
+    } catch (error) {
+        console.error(error);
+        setRecordingStatus('Не удалось загрузить состояние распознавания речи.');
+    }
 }
 
 async function loadVoices() {
@@ -164,13 +353,11 @@ async function loadVoices() {
         ]);
         if (!voicesResponse.ok) throw new Error("Не удалось загрузить голоса");
         if (!capabilitiesResponse.ok) throw new Error("Не удалось загрузить возможности движков");
-
         const data = await voicesResponse.json();
         capabilities = await capabilitiesResponse.json();
         availableVoices.system = data.system || [];
         availableVoices.neural = data.neural || [];
         updateVoiceOptions();
-
         if (!capabilities.system?.available && !capabilities.neural?.available) {
             statusEl.textContent = "Нет доступных движков синтеза. Установите Kokoro или запустите проект на macOS с say.";
         }
@@ -184,7 +371,6 @@ function splitLongFragment(text, maxLen) {
     const words = text.split(/\s+/).filter(Boolean);
     const parts = [];
     let current = "";
-
     for (const word of words) {
         const candidate = current ? `${current} ${word}` : word;
         if (candidate.length <= maxLen) {
@@ -209,31 +395,23 @@ function splitTextIntoChunks(text, maxLen = 90) {
 
     const chunks = [];
     let current = "";
-
     for (const part of roughParts) {
         if (!current) {
-            if (part.length <= maxLen) {
-                current = part;
-            } else {
-                chunks.push(...splitLongFragment(part, maxLen));
-            }
+            if (part.length <= maxLen) current = part;
+            else chunks.push(...splitLongFragment(part, maxLen));
             continue;
         }
-
         const candidate = `${current} ${part}`;
-        if (candidate.length <= maxLen) {
-            current = candidate;
-        } else {
+        if (candidate.length <= maxLen) current = candidate;
+        else {
             chunks.push(current);
-            if (part.length <= maxLen) {
-                current = part;
-            } else {
+            if (part.length <= maxLen) current = part;
+            else {
                 chunks.push(...splitLongFragment(part, maxLen));
                 current = "";
             }
         }
     }
-
     if (current) chunks.push(current);
     return chunks.filter(Boolean);
 }
@@ -246,9 +424,7 @@ async function ensureAudioContext() {
         masterGain.gain.value = 1;
         masterGain.connect(audioCtx.destination);
     }
-    if (audioCtx.state === "suspended") {
-        await audioCtx.resume();
-    }
+    if (audioCtx.state === "suspended") await audioCtx.resume();
 }
 
 function abortPrefetch() {
@@ -290,15 +466,9 @@ async function synthesizeDecodedChunk(chunkText, settings, sessionId, signal) {
     const response = await fetch("/synthesize", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-            text: chunkText,
-            engine: settings.engine,
-            voice: settings.voice,
-            rate: settings.rate
-        }),
+        body: JSON.stringify({ text: chunkText, engine: settings.engine, voice: settings.voice, rate: settings.rate }),
         signal
     });
-
     if (!response.ok) {
         let detail = "Ошибка синтеза";
         try {
@@ -307,7 +477,6 @@ async function synthesizeDecodedChunk(chunkText, settings, sessionId, signal) {
         } catch (_) {}
         throw new Error(detail);
     }
-
     const arrayBuffer = await response.arrayBuffer();
     if (sessionId !== currentSessionId) return null;
     await ensureAudioContext();
@@ -320,7 +489,6 @@ function scheduleDecodedChunk(index, sessionId) {
     if (sessionId !== currentSessionId) return;
     const buffer = decodedChunks[index];
     if (!buffer) return;
-
     const isFirst = index === 0;
     const source = audioCtx.createBufferSource();
     const gainNode = audioCtx.createGain();
@@ -333,9 +501,7 @@ function scheduleDecodedChunk(index, sessionId) {
     const effectiveStart = isFirst ? startAt : startAt + overlapSec;
 
     gainNode.gain.setValueAtTime(isFirst ? 1 : 0, startAt);
-    if (!isFirst) {
-        gainNode.gain.linearRampToValueAtTime(1, startAt + fade);
-    }
+    if (!isFirst) gainNode.gain.linearRampToValueAtTime(1, startAt + fade);
     const fadeOutStart = Math.max(startAt + fade, startAt + buffer.duration - fade);
     gainNode.gain.setValueAtTime(1, fadeOutStart);
     gainNode.gain.linearRampToValueAtTime(0, startAt + buffer.duration);
@@ -355,10 +521,7 @@ function scheduleDecodedChunk(index, sessionId) {
     chunkStartTimes[index] = startAt;
     chunkEffectiveStarts[index] = effectiveStart;
     chunkDurations[index] = buffer.duration;
-
-    if (isFirst) {
-        firstChunkCtxStart = effectiveStart;
-    }
+    if (isFirst) firstChunkCtxStart = effectiveStart;
     nextScheduleTime = startAt + buffer.duration;
 }
 
@@ -369,7 +532,6 @@ async function prefetchAndSchedule(index, sessionId) {
             if (!chunkStartTimes[i]) scheduleDecodedChunk(i, sessionId);
             continue;
         }
-
         prefetchAbortController = new AbortController();
         const decoded = await synthesizeDecodedChunk(chunkTexts[i], currentPlaybackSettings, sessionId, prefetchAbortController.signal);
         if (sessionId !== currentSessionId || isPaused || !decoded) return;
@@ -391,38 +553,23 @@ function getElapsedPlaybackSec() {
 }
 
 function computePositionFromElapsed(elapsedSec) {
-    if (!chunkTexts.length) {
-        return { chunkIndex: 0, charIndexInChunk: 0, globalCharOffset: 0 };
-    }
-
+    if (!chunkTexts.length) return { chunkIndex: 0, charIndexInChunk: 0, globalCharOffset: 0 };
     let consumedTime = 0;
     let globalCharOffset = 0;
-
     for (let i = 0; i < chunkTexts.length; i += 1) {
         const chunkText = chunkTexts[i] || "";
         const duration = chunkDurations[i] || Math.max(0.25, chunkText.length / 18);
         const effectiveDuration = i < chunkTexts.length - 1 ? Math.max(0.05, duration - overlapSec) : duration;
-
         if (elapsedSec <= consumedTime + effectiveDuration) {
             const local = Math.max(0, elapsedSec - consumedTime);
             const ratio = Math.max(0, Math.min(1, local / effectiveDuration));
             const charIndexInChunk = Math.min(chunkText.length, Math.floor(chunkText.length * ratio));
-            return {
-                chunkIndex: i,
-                charIndexInChunk,
-                globalCharOffset: globalCharOffset + charIndexInChunk
-            };
+            return { chunkIndex: i, charIndexInChunk, globalCharOffset: globalCharOffset + charIndexInChunk };
         }
-
         consumedTime += effectiveDuration;
         globalCharOffset += chunkText.length + 1;
     }
-
-    return {
-        chunkIndex: chunkTexts.length - 1,
-        charIndexInChunk: (chunkTexts[chunkTexts.length - 1] || "").length,
-        globalCharOffset: activeText.length
-    };
+    return { chunkIndex: chunkTexts.length - 1, charIndexInChunk: (chunkTexts[chunkTexts.length - 1] || "").length, globalCharOffset: activeText.length };
 }
 
 function buildRemainingTextFromPosition(position) {
@@ -440,26 +587,21 @@ async function startChunkedPlayback(text) {
         statusEl.textContent = "Поле текста пустое или не удалось получить введённый текст.";
         return;
     }
-
     const settings = getCurrentSettings(cleanedText);
     resetPlaybackState();
     await ensureAudioContext();
-
     const sessionId = currentSessionId;
     currentPlaybackSettings = settings;
     activeText = cleanedText;
     remainingText = cleanedText;
     chunkTexts = splitTextIntoChunks(cleanedText, settings.engine === "system" ? 72 : 110);
-
     if (!chunkTexts.length) {
         statusEl.textContent = "Не удалось разбить текст на фрагменты.";
         return;
     }
-
     isPlaying = true;
     isPaused = false;
     statusEl.textContent = `Генерируется первый фрагмент из ${chunkTexts.length}...`;
-
     try {
         loopPromise = prefetchAndSchedule(0, sessionId);
         await loopPromise;
@@ -491,21 +633,17 @@ async function resumeAudio() {
         statusEl.textContent = "Нет текста для продолжения.";
         return;
     }
-
     const settingsNow = getCurrentSettings(textToResume);
     const changed = !sameSettings(settingsNow, currentPlaybackSettings);
     statusEl.textContent = changed
         ? "Продолжение с нового голоса/скорости: первый фрагмент запускается сразу, переходы между кусками сглажены."
         : "Продолжение...";
-
     await startChunkedPlayback(textToResume);
 }
 
 function stopAudio(resetText = false) {
     resetPlaybackState();
-    if (resetText) {
-        lastKnownText = normalizeInputText(textEl.value || "");
-    }
+    if (resetText) lastKnownText = normalizeInputText(textEl.value || "");
     statusEl.textContent = "Остановлено";
 }
 
@@ -516,42 +654,246 @@ function clearText() {
     statusEl.textContent = "Поле очищено";
 }
 
-speakBtn.addEventListener("click", async (event) => {
-    event.preventDefault();
-    lastKnownText = normalizeInputText(textEl.value || "");
-    await startChunkedPlayback(lastKnownText);
-});
-
-pauseBtn.addEventListener("click", pauseAudio);
-resumeBtn.addEventListener("click", resumeAudio);
-stopBtn.addEventListener("click", () => stopAudio(true));
-clearBtn.addEventListener("click", clearText);
-function pauseForSettingsChange(reason) {
-    if (isPlaying && !isPaused) {
-        pauseAudio();
+async function startRecording() {
+    if (!navigator.mediaDevices?.getUserMedia) {
+        setRecordingStatus('Браузер не поддерживает запись с микрофона.');
+        return;
     }
-    if (reason === "engine") {
-        statusEl.textContent = "Движок изменён. Воспроизведение остановлено. Нажмите «Продолжить», чтобы продолжить с этого же места уже с новыми настройками.";
-    } else if (reason === "voice") {
-        statusEl.textContent = "Голос изменён. Воспроизведение остановлено. Нажмите «Продолжить», чтобы продолжить с этого же места уже новым голосом.";
-    } else if (reason === "rate") {
-        statusEl.textContent = "Скорость изменена. Воспроизведение остановлено. Нажмите «Продолжить», чтобы продолжить с этого же места уже с новой скоростью.";
+    if (mediaRecorder && mediaRecorder.state === 'recording') {
+        setRecordingStatus('Запись уже идёт.');
+        return;
+    }
+    try {
+        if (isPlaying && !isPaused) pauseAudio();
+        recordedChunks = [];
+        recordedBlob = null;
+        hasDetectedSpeech = false;
+        lastStopReason = 'manual';
+        recordingStartedAt = Date.now();
+        lastVoiceActivityAt = recordingStartedAt;
+        recordedAudioEl.style.display = 'none';
+        recordedAudioEl.removeAttribute('src');
+        setMicLevel(0);
+        setMicLevelText('Подключаю микрофон...');
+        updateRecordingButtons();
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true,
+                channelCount: 1,
+            }
+        });
+        await startMicMonitoring(mediaStream);
+        const preferredMimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+            ? 'audio/webm;codecs=opus'
+            : (MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : '');
+        mediaRecorder = preferredMimeType ? new MediaRecorder(mediaStream, { mimeType: preferredMimeType }) : new MediaRecorder(mediaStream);
+        mediaRecorder.ondataavailable = (event) => {
+            if (event.data && event.data.size > 0) recordedChunks.push(event.data);
+        };
+        mediaRecorder.onstop = () => {
+            const mimeType = mediaRecorder?.mimeType || 'audio/webm';
+            recordedBlob = new Blob(recordedChunks, { type: mimeType });
+            if (recordedBlob.size > 0) {
+                recordedAudioEl.src = URL.createObjectURL(recordedBlob);
+                recordedAudioEl.style.display = 'block';
+                if (lastStopReason === 'silence') {
+                    setRecordingStatus(`Запись автоматически остановлена по тишине. Размер: ${(recordedBlob.size / 1024).toFixed(1)} KB. Можно распознать или озвучить.`);
+                    setMicLevelText('Тишина обнаружена — запись завершена автоматически.');
+                } else {
+                    setRecordingStatus(`Запись готова: ${(recordedBlob.size / 1024).toFixed(1)} KB. Можно распознать или сразу получить голосовой ответ.`);
+                    setMicLevelText('Запись завершена. Индикатор микрофона остановлен.');
+                }
+            } else {
+                setRecordingStatus('Запись остановлена, но аудио не получилось сохранить.');
+                setMicLevelText('Сигнал не сохранён. Попробуй ещё раз.');
+            }
+            cleanupRecordingStream();
+            mediaRecorder = null;
+            updateRecordingButtons();
+        };
+        mediaRecorder.start();
+        setRecordingStatus('Идёт запись с микрофона... Запись автоматически остановится после короткой тишины.');
+        setMicLevelText('Слушаю микрофон. Скажи фразу — запись остановится после тишины.');
+        updateRecordingButtons();
+    } catch (error) {
+        console.error(error);
+        cleanupRecordingStream();
+        mediaRecorder = null;
+        updateRecordingButtons();
+        setRecordingStatus('Не удалось начать запись. Проверьте доступ к микрофону.');
+        setMicLevelText('Не удалось получить доступ к микрофону.');
     }
 }
 
-engineEl.addEventListener("change", () => {
-    updateVoiceOptions();
-    pauseForSettingsChange("engine");
-});
-textEl.addEventListener("input", () => { lastKnownText = normalizeInputText(textEl.value || ""); });
-voiceEl.addEventListener("change", () => {
-    pauseForSettingsChange("voice");
-});
-rateEl.addEventListener("change", () => {
-    pauseForSettingsChange("rate");
+function stopRecording(reason = 'manual') {
+    if (!mediaRecorder || mediaRecorder.state === 'inactive') {
+        setRecordingStatus('Сейчас нет активной записи.');
+        return;
+    }
+    lastStopReason = reason;
+    mediaRecorder.stop();
+    setRecordingStatus(reason === 'silence' ? 'Обнаружена тишина. Останавливаю запись...' : 'Остановка записи...');
+    setMicLevelText(reason === 'silence' ? 'Тишина подтверждена, завершаю запись.' : 'Останавливаю запись вручную.');
+    updateRecordingButtons();
+}
+
+function buildRecordedAudioFormData() {
+    if (!recordedBlob || recordedBlob.size === 0) {
+        throw new Error('Сначала запишите голосовую фразу.');
+    }
+    const formData = new FormData();
+    const extension = recordedBlob.type.includes('webm') ? 'webm' : 'wav';
+    formData.append('audio', recordedBlob, `recording.${extension}`);
+    const language = normalizeInputText(languageEl.value || '');
+    if (language) formData.append('language', language);
+    return formData;
+}
+
+async function fetchJsonOrThrow(response, defaultMessage) {
+    if (response.ok) return response.json();
+    let detail = defaultMessage;
+    try {
+        const data = await response.json();
+        detail = data.detail || detail;
+    } catch (_) {}
+    throw new Error(detail);
+}
+
+async function recognizeRecordedAudio() {
+    try {
+        const formData = buildRecordedAudioFormData();
+        setBusy(recognizeBtn, true, 'Распознаю...');
+        setRecordingStatus('Распознавание выполняется...');
+        const response = await fetch('/recognize', { method: 'POST', body: formData });
+        const data = await fetchJsonOrThrow(response, 'Ошибка распознавания');
+        const recognizedText = normalizeInputText(data.text || '');
+        if (!recognizedText) {
+            setRecordingStatus('Речь не распознана. Попробуйте сказать фразу громче и чётче.');
+            return;
+        }
+        textEl.value = recognizedText;
+        lastKnownText = recognizedText;
+        setRecordingStatus(`Распознавание завершено. Язык: ${data.language || 'unknown'}. Текст подставлен в поле.`);
+        statusEl.textContent = 'Распознанный текст загружен в поле. Теперь можно получить текстовый или голосовой ответ.';
+        updateVoiceOptions();
+        return data;
+    } catch (error) {
+        console.error(error);
+        setRecordingStatus(error?.message || 'Ошибка распознавания записи');
+        return null;
+    } finally {
+        setBusy(recognizeBtn, false);
+    }
+}
+
+async function fetchAssistantReply(text) {
+    const cleaned = normalizeInputText(text);
+    if (!cleaned) {
+        statusEl.textContent = 'Сначала введи или распознай текст.';
+        return null;
+    }
+    setBusy(assistantReplyBtn, true, 'Думаю...');
+    try {
+        const response = await fetch('/assistant/respond', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: cleaned })
+        });
+        const data = await fetchJsonOrThrow(response, 'Ошибка получения ответа');
+        const replyText = normalizeInputText(data.reply_text || '');
+        if (!replyText) throw new Error('Ответ ассистента пустой');
+        textEl.value = replyText;
+        lastKnownText = replyText;
+        statusEl.textContent = `Ответ готов. Исходный текст: ${cleaned}`;
+        return data;
+    } catch (error) {
+        console.error(error);
+        statusEl.textContent = error?.message || 'Ошибка получения ответа';
+        return null;
+    } finally {
+        setBusy(assistantReplyBtn, false);
+    }
+}
+
+async function answerCurrentTextWithVoice() {
+    const originalText = getCurrentText();
+    const data = await fetchAssistantReply(originalText);
+    if (!data?.reply_text) return;
+    await startChunkedPlayback(data.reply_text);
+}
+
+async function runVoiceTurn() {
+    try {
+        const formData = buildRecordedAudioFormData();
+        setBusy(voiceTurnBtn, true, 'Озвучиваю...');
+        setRecordingStatus('Распознаю запись и озвучиваю распознанный текст...');
+        const response = await fetch('/assistant/voice-turn', { method: 'POST', body: formData });
+        const data = await fetchJsonOrThrow(response, 'Ошибка сценария распознавания и озвучивания');
+        const recognizedText = normalizeInputText(data.recognized_text || data.spoken_text || data.reply_text || '');
+        if (!recognizedText) {
+            setRecordingStatus('Речь не распознана. Попробуйте ещё раз.');
+            return;
+        }
+        textEl.value = recognizedText;
+        lastKnownText = recognizedText;
+        setRecordingStatus(`Распознано и подготовлено к озвучиванию: ${recognizedText}`);
+        statusEl.textContent = 'В поле подставлен именно распознанный текст. Сейчас он будет озвучен.';
+        await startChunkedPlayback(recognizedText);
+    } catch (error) {
+        console.error(error);
+        setRecordingStatus(error?.message || 'Ошибка сценария распознавания и озвучивания');
+    } finally {
+        setBusy(voiceTurnBtn, false);
+    }
+}
+
+speakBtn.addEventListener('click', async (event) => {
+    event.preventDefault();
+    lastKnownText = normalizeInputText(textEl.value || '');
+    await startChunkedPlayback(lastKnownText);
 });
 
+assistantReplyBtn.addEventListener('click', async () => {
+    await fetchAssistantReply(getCurrentText());
+});
+
+voiceReplyBtn.addEventListener('click', async () => {
+    await answerCurrentTextWithVoice();
+});
+
+pauseBtn.addEventListener('click', pauseAudio);
+resumeBtn.addEventListener('click', resumeAudio);
+stopBtn.addEventListener('click', () => stopAudio(true));
+clearBtn.addEventListener('click', clearText);
+recordBtn.addEventListener('click', startRecording);
+stopRecordBtn.addEventListener('click', stopRecording);
+recognizeBtn.addEventListener('click', recognizeRecordedAudio);
+voiceTurnBtn.addEventListener('click', runVoiceTurn);
+
+function pauseForSettingsChange(reason) {
+    if (isPlaying && !isPaused) pauseAudio();
+    if (reason === 'engine') {
+        statusEl.textContent = 'Движок изменён. Воспроизведение остановлено. Нажмите «Продолжить», чтобы продолжить с этого же места уже с новыми настройками.';
+    } else if (reason === 'voice') {
+        statusEl.textContent = 'Голос изменён. Воспроизведение остановлено. Нажмите «Продолжить», чтобы продолжить с этого же места уже новым голосом.';
+    } else if (reason === 'rate') {
+        statusEl.textContent = 'Скорость изменена. Воспроизведение остановлено. Нажмите «Продолжить», чтобы продолжить с этого же места уже с новой скоростью.';
+    }
+}
+
+engineEl.addEventListener('change', () => {
+    updateVoiceOptions();
+    pauseForSettingsChange('engine');
+});
+textEl.addEventListener('input', () => { lastKnownText = normalizeInputText(textEl.value || ''); });
+voiceEl.addEventListener('change', () => { pauseForSettingsChange('voice'); });
+rateEl.addEventListener('change', () => { pauseForSettingsChange('rate'); });
+
+updateRecordingButtons();
 loadVoices();
+loadAsrCapabilities();
 </script>
 </body>
 </html>

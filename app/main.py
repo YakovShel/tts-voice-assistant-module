@@ -5,11 +5,12 @@ import shutil
 from pathlib import Path
 from typing import Iterable
 
-from fastapi import FastAPI, HTTPException, Request, Query
+from fastapi import FastAPI, HTTPException, Request, Query, UploadFile, File, Form
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
+from app.asr_engine import get_asr_capabilities, save_upload_to_temp, transcribe_audio_file, warmup_model
 from app.assistant_logic import generate_assistant_reply
 from app.cache_utils import build_cache_key, get_cached_file_path, has_cached_file
 from app.config import MAX_TEXT_LENGTH, TEMPLATES_DIR
@@ -22,10 +23,17 @@ from app.tts_engine import (
     get_system_voices,
     get_neural_voices,
     get_engine_capabilities,
+    split_text_by_language,
 )
 
-app = FastAPI(title='TTS Service')
+app = FastAPI(title='Voice Assistant Service')
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+
+
+@app.on_event("startup")
+def startup_warmup_asr():
+    import threading
+    threading.Thread(target=warmup_model, daemon=True).start()
 
 
 class SynthesizeRequest(BaseModel):
@@ -46,7 +54,11 @@ def index(request: Request):
 
 @app.get('/health')
 def health():
-    return {'status': 'ok', 'capabilities': get_engine_capabilities()}
+    return {
+        'status': 'ok',
+        'tts_capabilities': get_engine_capabilities(),
+        'asr_capabilities': get_asr_capabilities(),
+    }
 
 
 @app.get('/engines')
@@ -70,6 +82,37 @@ def get_history(limit: int = Query(default=20, ge=1, le=100)):
     return {'items': read_history(limit=limit)}
 
 
+@app.get('/asr-capabilities')
+def asr_capabilities():
+    return get_asr_capabilities()
+
+
+@app.post('/recognize')
+def recognize_audio(audio: UploadFile = File(...), language: str | None = Form(default=None)):
+    caps = get_asr_capabilities()
+    if not caps.get('available'):
+        reason = caps.get('reason') or 'speech recognition engine unavailable'
+        raise HTTPException(status_code=503, detail=reason)
+
+    temp_path = None
+    try:
+        temp_path = save_upload_to_temp(audio)
+        result = transcribe_audio_file(temp_path, language=language)
+        if not result.get('text'):
+            return {'text': '', 'language': result.get('language'), 'segments': result.get('segments', [])}
+        return result
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Recognition failed: {exc}') from exc
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
 @app.get('/stats')
 def stats():
     return compute_stats()
@@ -79,6 +122,44 @@ def stats():
 def assistant_respond(request: AssistantRequest):
     text = normalize_text(request.text, allow_empty=True)
     return {'request_text': text, 'reply_text': generate_assistant_reply(text)}
+
+
+@app.post('/assistant/voice-turn')
+def assistant_voice_turn(audio: UploadFile = File(...), language: str | None = Form(default=None)):
+    caps = get_asr_capabilities()
+    if not caps.get('available'):
+        reason = caps.get('reason') or 'speech recognition engine unavailable'
+        raise HTTPException(status_code=503, detail=reason)
+
+    temp_path = None
+    try:
+        temp_path = save_upload_to_temp(audio)
+        recognized = transcribe_audio_file(temp_path, language=language)
+        recognized_text = normalize_text(recognized.get('text', ''), allow_empty=True)
+        return {
+            'recognized_text': recognized_text,
+            'reply_text': recognized_text,
+            'spoken_text': recognized_text,
+            'mode': 'recognize_and_speak_recognized_text',
+            'recognition': recognized,
+        }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f'Voice turn failed: {exc}') from exc
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+
+
+def has_mixed_ru_en_text(text: str) -> bool:
+    langs = {segment.get('lang') for segment in split_text_by_language(text)}
+    return 'ru' in langs and 'en' in langs
 
 
 def normalize_text(text: str, *, allow_empty: bool = False) -> str:
@@ -236,52 +317,102 @@ def synthesize_stream(request: SynthesizeRequest):
     if request.rate <= 0:
         raise HTTPException(status_code=400, detail='rate must be greater than 0')
 
+    mixed_language = has_mixed_ru_en_text(text)
     selected_engine = request.engine if request.engine != 'auto' else 'neural'
     selected_engine = resolve_engine(selected_engine, text)
-    if selected_engine != 'neural':
-        raise HTTPException(status_code=400, detail='Streaming currently supports only neural engine')
 
-    validate_voice_for_engine('neural', request.voice)
-    cache_key = build_cache_key(text=text, engine='neural', voice=request.voice, rate=request.rate)
-    cached_wav_path = get_cached_file_path(cache_key, '.wav')
-    cache_hit = has_cached_file(cache_key, '.wav')
+    validate_voice_for_engine(selected_engine, request.voice)
+    cache_key = build_cache_key(text=text, engine=selected_engine, voice=request.voice, rate=request.rate)
+    cached_path = get_cached_file_path(cache_key, '.wav')
 
-    try:
-        raw_stream = stream_wav_file_as_pcm(cached_wav_path) if cache_hit else stream_kokoro_pcm(
-            text=text,
-            voice=request.voice,
-            rate=request.rate,
-            cache_wav_path=cached_wav_path,
+    if has_cached_file(cache_key, '.wav'):
+        elapsed = round(perf_counter() - start_time, 4)
+        log_history({
+            'mode': 'stream',
+            'text': text,
+            'engine_requested': request.engine,
+            'engine_used': selected_engine,
+            'voice': request.voice,
+            'rate': request.rate,
+            'cache_hit': True,
+            'duration_sec': elapsed,
+            'file_path': str(cached_path),
+            'completed': True,
+            'error': None,
+        })
+        return StreamingResponse(
+            stream_wav_file_as_pcm(cached_path),
+            media_type='application/octet-stream',
+            headers={'X-Audio-Format': 'pcm-f32le', 'X-Sample-Rate': '24000', 'X-Channels': '1'}
         )
-    except RuntimeError as exc:
-        _log_failure('stream', request.engine, 'neural', request.voice, request.rate, text, start_time, str(exc))
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-    def tracked_stream():
-        stream_error = None
+    if mixed_language:
+        generated_path = None
         try:
-            for chunk in raw_stream:
-                yield chunk
-        except Exception as exc:
-            stream_error = exc
-            raise
+            generated_path = synthesize_to_file(text=text, engine=selected_engine, voice=request.voice, rate=request.rate)
+            shutil.move(str(generated_path), str(cached_path))
         finally:
-            elapsed = round(perf_counter() - start_time, 4)
-            final_file_path = str(cached_wav_path) if cached_wav_path.exists() else None
-            log_history({
-                'mode': 'stream',
-                'text': text,
-                'engine_requested': request.engine,
-                'engine_used': 'neural',
-                'voice': request.voice,
-                'rate': request.rate,
-                'cache_hit': cache_hit,
-                'duration_sec': elapsed,
-                'file_path': final_file_path,
-                'completed': stream_error is None,
-                'error': str(stream_error) if stream_error else None,
-            })
+            _safe_unlink(generated_path)
 
-    return StreamingResponse(tracked_stream(), media_type='application/octet-stream', headers={
-        'X-Audio-Format': 'pcm-f32le', 'X-Sample-Rate': '24000', 'X-Channels': '1'
+        elapsed = round(perf_counter() - start_time, 4)
+        log_history({
+            'mode': 'stream',
+            'text': text,
+            'engine_requested': request.engine,
+            'engine_used': selected_engine,
+            'voice': request.voice,
+            'rate': request.rate,
+            'cache_hit': False,
+            'duration_sec': elapsed,
+            'file_path': str(cached_path),
+            'completed': True,
+            'error': None,
+        })
+        return StreamingResponse(
+            stream_wav_file_as_pcm(cached_path),
+            media_type='application/octet-stream',
+            headers={'X-Audio-Format': 'pcm-f32le', 'X-Sample-Rate': '24000', 'X-Channels': '1'}
+        )
+
+    if selected_engine != 'neural':
+        raise HTTPException(status_code=400, detail='Streaming currently supports only neural engine for single-language text')
+
+    def stream_generator():
+        try:
+            yield from stream_kokoro_pcm(text=text, voice=request.voice, rate=request.rate, cache_wav_path=cached_path)
+        except Exception as exc:
+            _safe_unlink(cached_path)
+            raise exc
+
+    elapsed = round(perf_counter() - start_time, 4)
+    log_history({
+        'mode': 'stream',
+        'text': text,
+        'engine_requested': request.engine,
+        'engine_used': 'neural',
+        'voice': request.voice,
+        'rate': request.rate,
+        'cache_hit': False,
+        'duration_sec': elapsed,
+        'file_path': str(cached_path),
+        'completed': True,
+        'error': None,
     })
+    return StreamingResponse(
+        stream_generator(),
+        media_type='application/octet-stream',
+        headers={'X-Audio-Format': 'pcm-f32le', 'X-Sample-Rate': '24000', 'X-Channels': '1'}
+    )
+
+
+@app.get('/download')
+def download_audio(path: str):
+    target = Path(path)
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail='File not found')
+    return FileResponse(path=target, media_type='audio/wav', filename=target.name)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(_, exc: HTTPException):
+    return JSONResponse(status_code=exc.status_code, content={'detail': exc.detail})
